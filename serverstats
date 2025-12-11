@@ -1,0 +1,399 @@
+package main // main package, this is entry point of program :)
+
+import (
+	"bufio"   // for buffered reading line by line from files or commands
+	"bytes"   // to use byte slices as readers, like wrap []byte into Reader :)
+	"fmt"     // for formatted printing to stdout
+	"os"      // for OS functions, like files, hostname, etc
+	"os/exec" // to run external command like ps, who, lastb
+	"runtime" // to get GOOS, GOARCH and runtime info
+	"sort"    // for sorting slices like processes slice
+	"strconv" // for convert string to number and reverse if needed :)
+	"strings" // for working with strings, trimming, split, prefix checks
+	"syscall" // for low-level system calls, here used Statfs for disk stats
+	"time"    // for sleep and time-related actions
+)
+
+// cpuTimes hold cpu idle and total ticks from /proc/stat
+type cpuTimes struct {
+	idle  uint64 // idle time from cpu line
+	total uint64 // total time sum of all cpu fields
+}
+
+// memInfo store memory information from /proc/meminfo
+type memInfo struct {
+	totalKB uint64 // total memory in kilobytes
+	availKB uint64 // available memory in kilobytes (MemAvailable)
+}
+
+// diskUsage keep disk usage info in bytes
+type diskUsage struct {
+	total uint64 // total disk size in bytes
+	free  uint64 // free/available disk space in bytes
+	used  uint64 // used disk space in bytes
+}
+
+// processStat store information about one process
+type processStat struct {
+	PID  int     // process ID
+	Comm string  // command name of process
+	CPU  float64 // percent CPU usage of process
+	MEM  float64 // percent memory usage of process
+}
+
+// hr print horizontal line for separate sections
+func hr() {
+	fmt.Println(strings.Repeat("-", 80)) // repeat "-" 80 times and print
+}
+
+// printHeader show nice section header with title and lines
+func printHeader(title string) {
+	hr()               // print top line
+	fmt.Println(title) // print title text
+	hr()               // print bottom line
+}
+
+// readCPUTimes read cpu total and idle times from /proc/stat
+func readCPUTimes() (cpuTimes, error) {
+	data, err := os.ReadFile("/proc/stat") // read all content of /proc/stat file
+	if err != nil {                        // if any error happen
+		return cpuTimes{}, err // return empty struct and error
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data)) // create scanner to read data line by line
+	for scanner.Scan() {                               // loop for each line
+		line := scanner.Text()               // get current line text
+		if strings.HasPrefix(line, "cpu ") { // we only care about line start with "cpu "
+			fields := strings.Fields(line) // split line into fields by spaces
+			if len(fields) < 5 {           // we expect at least 5 fields (cpu + some numbers)
+				return cpuTimes{}, fmt.Errorf("unexpected /proc/stat format") // return error if not enough
+			}
+			var total uint64                   // variable to store total cpu time
+			var idle uint64                    // variable to store idle time
+			for i := 1; i < len(fields); i++ { // loop over numeric fields, start from index 1 (skip "cpu")
+				val, err := strconv.ParseUint(fields[i], 10, 64) // convert field string to uint64
+				if err != nil {                                  // if convert fail
+					return cpuTimes{}, err // return error
+				}
+				total += val // add value to total cpu time
+				if i == 4 {  // idle is 4th value after "cpu", so index 4
+					idle = val // store idle value
+				}
+			}
+			return cpuTimes{idle: idle, total: total}, nil // return cpuTimes with idle and total
+		}
+	}
+	return cpuTimes{}, fmt.Errorf("cpu line not found in /proc/stat") // if no "cpu " line found, error
+}
+
+// getCPUUsage calculate CPU usage percent over 1 second interval
+func getCPUUsage() (float64, error) {
+	t1, err := readCPUTimes() // read first cpu times snapshot
+	if err != nil {           // check error
+		return 0, err // return 0 and error
+	}
+	time.Sleep(1 * time.Second) // wait 1 second to measure difference
+	t2, err := readCPUTimes()   // read second cpu times snapshot
+	if err != nil {             // check error
+		return 0, err // return 0 and error
+	}
+
+	idleDiff := float64(t2.idle - t1.idle)    // how much idle time increased between two reads
+	totalDiff := float64(t2.total - t1.total) // how much total time increased
+	if totalDiff <= 0 {                       // if total is zero or negative, something is off
+		return 0, nil // just return 0 usage
+	}
+	usage := (1.0 - idleDiff/totalDiff) * 100.0 // CPU usage formula: (1 - idle/total) * 100
+	return usage, nil                           // return CPU usage percent
+}
+
+// getMemInfo read memory info from /proc/meminfo
+func getMemInfo() (memInfo, error) {
+	f, err := os.Open("/proc/meminfo") // open the meminfo file
+	if err != nil {                    // if cannot open
+		return memInfo{}, err // return error
+	}
+	defer f.Close() // ensure file closed when function end :)
+
+	var info memInfo               // create memInfo variable to fill
+	scanner := bufio.NewScanner(f) // scanner to read meminfo line by line
+	for scanner.Scan() {           // loop through each line
+		line := scanner.Text()                    // get current line
+		if strings.HasPrefix(line, "MemTotal:") { // if line show total memory
+			fields := strings.Fields(line) // split into fields
+			if len(fields) >= 2 {          // need at least key and value
+				val, err := strconv.ParseUint(fields[1], 10, 64) // parse second field as uint64
+				if err == nil {                                  // if parse is ok
+					info.totalKB = val // store value in totalKB
+				}
+			}
+		}
+		if strings.HasPrefix(line, "MemAvailable:") { // if line show available memory
+			fields := strings.Fields(line) // split into fields
+			if len(fields) >= 2 {          // check count
+				val, err := strconv.ParseUint(fields[1], 10, 64) // parse value
+				if err == nil {                                  // if no error
+					info.availKB = val // store in availKB
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil { // check if scanner has error
+		return memInfo{}, err // return error
+	}
+	if info.totalKB == 0 { // if totalKB still zero, something wrong
+		return memInfo{}, fmt.Errorf("could not read MemTotal") // return error
+	}
+	return info, nil // return memory info with total and available
+}
+
+// getDiskUsage get disk usage for given path (like "/")
+func getDiskUsage(path string) (diskUsage, error) {
+	var stat syscall.Statfs_t          // struct for filesystem stats
+	err := syscall.Statfs(path, &stat) // call Statfs on path to fill stat
+	if err != nil {                    // if error happen
+		return diskUsage{}, err // return empty and error
+	}
+	total := stat.Blocks * uint64(stat.Bsize)                   // total bytes = total blocks * block size
+	free := stat.Bavail * uint64(stat.Bsize)                    // free bytes = available blocks * block size
+	used := total - free                                        // used bytes = total - free
+	return diskUsage{total: total, free: free, used: used}, nil // return diskUsage struct
+}
+
+// humanizeBytes convert bytes number to human readable string (KiB, MiB, GiB, etc)
+func humanizeBytes(b uint64) string {
+	const unit = 1024 // unit is 1024 for binary
+	if b < unit {     // if less than 1 KiB
+		return fmt.Sprintf("%d B", b) // just show bytes
+	}
+	div, exp := uint64(unit), 0               // div is current divisor, exp is power index
+	for n := b / unit; n >= unit; n /= unit { // loop dividing until n < unit
+		div *= unit // increase divisor by factor 1024
+		exp++       // increase exponent index
+	}
+	return fmt.Sprintf("%.1f %ciB",
+		float64(b)/float64(div), "KMGTPE"[exp]) // choose proper unit letter based on exp
+}
+
+// getOSPrettyName read pretty OS name from /etc/os-release
+func getOSPrettyName() string {
+	data, err := os.ReadFile("/etc/os-release") // read whole /etc/os-release file
+	if err != nil {                             // if fail (maybe not Linux)
+		return fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH) // fallback to GOOS GOARCH
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data)) // scanner to read file line by line
+	for scanner.Scan() {                               // loop lines
+		line := scanner.Text()                       // get line
+		if strings.HasPrefix(line, "PRETTY_NAME=") { // search for PRETTY_NAME
+			val := strings.TrimPrefix(line, "PRETTY_NAME=") // remove key prefix
+			val = strings.Trim(val, `"`)                    // trim quotes around string
+
+			return val // return pretty OS name
+		}
+	}
+	return fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH) // fallback if no PRETTY_NAME
+}
+
+// getUptime read system uptime from /proc/uptime and format it
+func getUptime() (string, error) {
+	data, err := os.ReadFile("/proc/uptime") // read uptime file
+	if err != nil {                          // if error
+		return "", err // return error
+	}
+	fields := strings.Fields(string(data)) // split by spaces
+	if len(fields) < 1 {                   // need at least one field
+		return "", fmt.Errorf("unexpected /proc/uptime format") // error format
+	}
+	secs, err := strconv.ParseFloat(fields[0], 64) // parse first field as seconds float
+	if err != nil {                                // if cannot parse
+		return "", err // return error
+	}
+	totalSeconds := int(secs)                                 // cast to int for easy work
+	days := totalSeconds / 86400                              // calculate days
+	hours := (totalSeconds % 86400) / 3600                    // remaining hours
+	mins := (totalSeconds % 3600) / 60                        // remaining minutes
+	return fmt.Sprintf("%dd %dh %dm", days, hours, mins), nil // return formatted uptime string
+}
+
+// getLoadAverage read load average from /proc/loadavg and return first 3 values
+func getLoadAverage() (string, error) {
+	data, err := os.ReadFile("/proc/loadavg") // read loadavg file
+	if err != nil {                           // if error
+		return "", err // return error
+	}
+	fields := strings.Fields(string(data)) // split by spaces
+	if len(fields) < 3 {                   // need at least 3 fields
+		return "", fmt.Errorf("unexpected /proc/loadavg format") // error
+	}
+	return fmt.Sprintf("%s %s %s", fields[0], fields[1], fields[2]), nil // return 1,5,15min load averages
+}
+
+// getProcesses run ps command and parse output into slice of processStat
+func getProcesses() ([]processStat, error) {
+	cmd := exec.Command("ps", "-eo", "pid,comm,%cpu,%mem", "--no-headers") // prepare ps command to list pid, command, cpu, mem
+	out, err := cmd.Output()                                               // run command and get stdout bytes
+	if err != nil {                                                        // if error when run ps
+		return nil, err // return error
+	}
+
+	var procs []processStat                           // slice to store processes
+	scanner := bufio.NewScanner(bytes.NewReader(out)) // scanner to read ps output line by line
+	for scanner.Scan() {                              // loop each line
+		line := strings.TrimSpace(scanner.Text()) // trim spaces of line
+		if line == "" {                           // skip empty line
+			continue
+		}
+		fields := strings.Fields(line) // split line to fields
+		if len(fields) < 4 {           // need at least 4 (pid, comm, %cpu, %mem)
+			continue // skip invalid line
+		}
+		pid, err1 := strconv.Atoi(fields[0])           // parse pid as int
+		cpu, err2 := strconv.ParseFloat(fields[2], 64) // parse %cpu as float64
+		mem, err3 := strconv.ParseFloat(fields[3], 64) // parse %mem as float64
+		if err1 != nil || err2 != nil || err3 != nil { // if any parse error
+			continue // skip this process line
+		}
+		procs = append(procs, processStat{ // append new processStat to slice
+			PID:  pid,       // set PID
+			Comm: fields[1], // set command name
+			CPU:  cpu,       // cpu usage percent
+			MEM:  mem,       // memory usage percent
+		})
+	}
+	if err := scanner.Err(); err != nil { // check scanner errors
+		return nil, err // return error
+	}
+	return procs, nil // return slice of processStat
+}
+
+// topByCPU sort copy of procs slice by CPU in descending and return top n
+func topByCPU(procs []processStat, n int) []processStat {
+	sort.Slice(procs, func(i, j int) bool { // sort slice with custom less function
+		return procs[i].CPU > procs[j].CPU // we want bigger CPU first
+	})
+	if len(procs) < n { // if there are less processes than n
+		n = len(procs) // adjust n to length
+	}
+	return procs[:n] // return first n elements
+}
+
+// topByMEM sort copy of procs slice by MEM in descending and return top n
+func topByMEM(procs []processStat, n int) []processStat {
+	sort.Slice(procs, func(i, j int) bool { // sort slice
+		return procs[i].MEM > procs[j].MEM // bigger memory usage come first :)
+	})
+	if len(procs) < n { // adjust n if needed
+		n = len(procs)
+	}
+	return procs[:n] // return top n processes by memory
+}
+
+// printLoggedInUsers show current logged users using 'who' command
+func printLoggedInUsers() {
+	cmd := exec.Command("who")       // prepare 'who' command
+	out, err := cmd.Output()         // execute command and get output
+	if err != nil || len(out) == 0 { // if error or empty output
+		fmt.Println("No users currently logged in or 'who' not available.") // print info message
+		return
+	}
+	fmt.Print(string(out)) // print output directly
+}
+
+// printFailedLogins show recent failed logins using 'lastb' command
+func printFailedLogins() {
+	cmd := exec.Command("lastb", "-n", "10") // prepare 'lastb -n 10' command for last 10 failed logins
+	out, err := cmd.CombinedOutput()         // execute and get combined stdout+stderr
+	if err != nil {                          // if error (maybe command not exist or permission denied)
+		fmt.Println("'lastb' not available or insufficient permissions.") // warn user
+		return
+	}
+	fmt.Print(string(out)) // print the command output
+}
+
+// main is entry point of program
+func main() {
+	printHeader("BASIC SERVER INFO")                                                   // print header for basic server information
+	fmt.Println("OS           :", getOSPrettyName())                                   // print OS pretty name
+	fmt.Println("Hostname     :", func() string { h, _ := os.Hostname(); return h }()) // inline function to get hostname and print
+	fmt.Println("Kernel       :", runtime.GOOS, runtime.GOARCH)                        // print kernel/go os and arch identifiers
+
+	uptime, err := getUptime() // get uptime string
+	if err == nil {            // if no error
+		fmt.Println("Uptime       :", uptime) // print uptime
+	} else {
+		fmt.Println("Uptime       : (error:", err, ")") // show error if uptime fail
+	}
+	load, err := getLoadAverage() // get load average
+	if err == nil {               // check error
+		fmt.Println("Load Average :", load) // print load average 1,5,15 min
+	} else {
+		fmt.Println("Load Average : (error:", err, ")") // print error message if fail
+	}
+
+	printHeader("CPU USAGE")       // header for CPU usage
+	cpuUsage, err := getCPUUsage() // calculate CPU usage over 1s
+	if err != nil {                // if error
+		fmt.Println("Error reading CPU usage:", err) // print error
+	} else {
+		fmt.Printf("Total CPU Usage: %.2f%%\n", cpuUsage) // print CPU usage with 2 decimal
+	}
+
+	printHeader("MEMORY USAGE") // header for memory usage section
+	mi, err := getMemInfo()     // get memory info
+	if err != nil {             // if error
+		fmt.Println("Error reading memory info:", err) // print error
+	} else {
+		totalMB := float64(mi.totalKB) / 1024.0        // convert total from KB to MB
+		availMB := float64(mi.availKB) / 1024.0        // convert available from KB to MB
+		usedMB := totalMB - availMB                    // calculate used memory in MB
+		perc := (usedMB / totalMB) * 100               // calculate memory usage percent
+		fmt.Printf("Total Memory: %.0f MB\n", totalMB) // print total memory
+		fmt.Printf("Used Memory : %.0f MB\n", usedMB)  // print used memory
+		fmt.Printf("Free/Avail  : %.0f MB\n", availMB) // print free/available memory
+		fmt.Printf("Usage       : %.2f%%\n", perc)     // print usage percent
+	}
+
+	printHeader("DISK USAGE (ROOT FILESYSTEM)") // header for disk usage
+	du, err := getDiskUsage("/")                // get disk usage for root filesystem
+	if err != nil {                             // if error
+		fmt.Println("Error reading disk usage:", err) // print error
+	} else {
+		fmt.Println("Total :", humanizeBytes(du.total))      // print total disk size in readable form
+		fmt.Println("Used  :", humanizeBytes(du.used))       // print used disk size
+		fmt.Println("Free  :", humanizeBytes(du.free))       // print free disk size
+		perc := (float64(du.used) / float64(du.total)) * 100 // calculate used percent
+		fmt.Printf("Usage : %.2f%%\n", perc)                 // print disk usage percent
+	}
+
+	printHeader("TOP 5 PROCESSES BY CPU USAGE") // header for top CPU processes
+	procs, err := getProcesses()                // get all processes info
+	if err != nil {                             // if cannot read processes
+		fmt.Println("Error reading processes:", err) // show error
+	} else {
+		topCPU := topByCPU(append([]processStat{}, procs...), 5)               // create copy of slice and get top 5 by CPU
+		fmt.Printf("%-8s %-20s %-8s %-8s\n", "PID", "COMMAND", "%CPU", "%MEM") // print table header
+		for _, p := range topCPU {                                             // loop over top CPU processes
+			fmt.Printf("%-8d %-20s %-8.2f %-8.2f\n", p.PID, p.Comm, p.CPU, p.MEM) // print each process row
+		}
+	}
+
+	printHeader("TOP 5 PROCESSES BY MEMORY USAGE") // header for top memory processes
+	if procs != nil {                              // if processes slice exist
+		topMEM := topByMEM(append([]processStat{}, procs...), 5)               // get top 5 by memory from copy
+		fmt.Printf("%-8s %-20s %-8s %-8s\n", "PID", "COMMAND", "%MEM", "%CPU") // print table header for mem view
+		for _, p := range topMEM {                                             // loop top MEM processes
+			fmt.Printf("%-8d %-20s %-8.2f %-8.2f\n", p.PID, p.Comm, p.MEM, p.CPU) // print each process row
+		}
+	} else {
+		fmt.Println("No process data available.") // fallback message if no process data :)
+	}
+
+	printHeader("LOGGED IN USERS") // header for logged in users section
+	printLoggedInUsers()           // call function to print 'who' output
+
+	printHeader("RECENT FAILED LOGIN ATTEMPTS (if available)") // header for failed login section
+	printFailedLogins()                                        // call function to print 'lastb' output
+
+	fmt.Println()        // print empty line
+	fmt.Println("Done.") // say we are done :)
+	hr()                 // final horizontal line separator
+}
