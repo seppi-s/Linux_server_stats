@@ -232,4 +232,6 @@ btmp log entries…
 | `ps`             | Process CPU & RAM usage |
 | `who`, `lastb`   | Login & security info   |
 
+we do this project_url : https://roadmap.sh/projects/server-stats in other way ! yay !
+
 ---
